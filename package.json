@@ -35,7 +35,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Borgels/mcp-server-severa.git"
+    "url": "git+https://github.com/borgels/mcp-server-severa.git"
   },
   "keywords": [
     "mcp",
@@ -51,9 +51,9 @@
     "node": ">=20.11"
   },
   "bugs": {
-    "url": "https://github.com/Borgels/mcp-server-severa/issues"
+    "url": "https://github.com/borgels/mcp-server-severa/issues"
   },
-  "homepage": "https://github.com/Borgels/mcp-server-severa#readme",
+  "homepage": "https://github.com/borgels/mcp-server-severa#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^4.4.3"
