@@ -118,6 +118,7 @@ export function searchSchemas(query: string, limit: number): Array<{ name: strin
 export function findOperation(method: string, path: string): SeveraCatalogOperation {
   const normalizedMethod = method.toUpperCase();
   const normalizedPath = normalizePath(path);
+  assertSafeRequestPath(normalizedPath);
   const operation = SEVERA_OPERATIONS.find(
     item => item.method === normalizedMethod && normalizePath(item.path) === normalizedPath,
   ) ?? SEVERA_OPERATIONS.find(
@@ -271,15 +272,29 @@ function normalizePath(path: string): string {
   return path.startsWith('/') ? path : `/${path}`;
 }
 
+/**
+ * Reject request paths that could change meaning after URL parsing: query or
+ * fragment delimiters, backslashes, percent-encoding and dot segments.
+ */
+export function assertSafeRequestPath(path: string): void {
+  if (/[?#%\\]/.test(path) || path.split('/').some(segment => segment === '.' || segment === '..')) {
+    throw new Error('Severa request path contains disallowed characters or segments.');
+  }
+}
+
+// One path parameter value: letters, digits and the punctuation used by
+// GUIDs, ISO dates and country names. No '/', '?', '#', '%' or '\\'.
+const PATH_PARAM_PATTERN = "[\\p{L}\\p{N}_~:+ .-]+";
+
 function pathTemplateRegex(path: string): RegExp {
   const pattern = normalizePath(path)
     .split('/')
     .map(segment => {
       if (/^\{[^}]+\}$/.test(segment)) {
-        return '[^/]+';
+        return PATH_PARAM_PATTERN;
       }
       return segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     })
     .join('/');
-  return new RegExp(`^${pattern}$`);
+  return new RegExp(`^${pattern}$`, 'u');
 }

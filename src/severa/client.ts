@@ -244,7 +244,11 @@ function appendQueryValue(searchParams: URLSearchParams, key: string, value: Sev
 }
 
 function trimTrailingSlash(value: string): string {
-  return value.replace(/\/+$/, '');
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) {
+    end -= 1;
+  }
+  return value.slice(0, end);
 }
 
 function assertSafeBaseUrl(baseUrl: string): void {
