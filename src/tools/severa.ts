@@ -16,11 +16,15 @@ import { type SeveraClient, type SeveraHttpMethod, type SeveraQueryValue, pagina
 import { checkRequestPolicy, checkToolPolicy } from '../severa/policy.js';
 import {
   assertAllowedReadOperation,
-  assertPreparedRequestHash,
+  guidParam,
   prepareSeveraRequest,
+  verifyPreparedRequest,
 } from '../severa/requests.js';
 
-const guidSchema = z.string().trim().min(1);
+const guidSchema = z
+  .string()
+  .trim()
+  .regex(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/, 'Use a Severa GUID.');
 const isoDateSchema = z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use YYYY-MM-DD.');
 const isoDateTimeSchema = z.string().trim().min(1);
 const querySchema = z.record(z.string(), z.unknown()).default({});
@@ -34,6 +38,7 @@ const paginationInputShape = {
 const preparedRequestSchema = z.object({
   type: z.literal('severa_prepared_request'),
   createdAt: z.string().trim().min(1),
+  expiresAt: z.string().trim().min(1),
   method: z.enum(['POST', 'PUT', 'PATCH', 'DELETE']),
   path: z.string().trim().min(1),
   query: z.record(z.string(), z.unknown()).default({}),
@@ -145,7 +150,7 @@ export function registerSeveraTools(server: McpServer, client: SeveraClient): vo
       inputSchema: { customerGuid: guidSchema },
       annotations: READ_TOOL_ANNOTATIONS,
     },
-    async input => runAuditedTool('severa_get_customer', input, async () => jsonToolResult(await client.get(`/v1/customers/${input.customerGuid}`))),
+    async input => runAuditedTool('severa_get_customer', input, async () => jsonToolResult(await client.get(`/v1/customers/${guidParam(input.customerGuid)}`))),
   );
 
   server.registerTool(
@@ -160,7 +165,7 @@ export function registerSeveraTools(server: McpServer, client: SeveraClient): vo
       annotations: READ_TOOL_ANNOTATIONS,
     },
     async input => runAuditedTool('severa_search_contacts', input, async () => {
-      const path = input.customerGuid ? `/v1/customers/${input.customerGuid}/contactpersons` : '/v1/contactpersons';
+      const path = input.customerGuid ? `/v1/customers/${guidParam(input.customerGuid)}/contactpersons` : '/v1/contactpersons';
       return jsonToolResult(await client.get(path, paginationQuery(input)));
     }),
   );
@@ -201,7 +206,7 @@ export function registerSeveraTools(server: McpServer, client: SeveraClient): vo
       inputSchema: { projectGuid: guidSchema },
       annotations: READ_TOOL_ANNOTATIONS,
     },
-    async input => runAuditedTool('severa_get_project', input, async () => jsonToolResult(await client.get(`/v1/projects/${input.projectGuid}`))),
+    async input => runAuditedTool('severa_get_project', input, async () => jsonToolResult(await client.get(`/v1/projects/${guidParam(input.projectGuid)}`))),
   );
 
   server.registerTool(
@@ -225,11 +230,11 @@ export function registerSeveraTools(server: McpServer, client: SeveraClient): vo
     async input => runAuditedTool('severa_project_overview', input, async () => {
       const query = { rowCount: input.rowCount };
       const result: Record<string, unknown> = {
-        project: await client.get(`/v1/projects/${input.projectGuid}`),
+        project: await client.get(`/v1/projects/${guidParam(input.projectGuid)}`),
       };
 
       if (input.includePhases || input.includeMembers) {
-        const phases = await client.get(`/v1/projects/${input.projectGuid}/phaseswithhierarchy`, query);
+        const phases = await client.get(`/v1/projects/${guidParam(input.projectGuid)}/phaseswithhierarchy`, query);
         result.phases = phases;
 
         if (input.includeMembers && Array.isArray(phases.data)) {
@@ -240,18 +245,18 @@ export function registerSeveraTools(server: McpServer, client: SeveraClient): vo
               .slice(0, input.rowCount)
               .map(async phaseGuid => ({
                 phaseGuid,
-                members: await client.get(`/v1/phases/${phaseGuid}/phasemembers`, query),
+                members: await client.get(`/v1/phases/${guidParam(phaseGuid)}/phasemembers`, query),
               })),
           );
         }
       }
 
       const entries = await Promise.all([
-        input.includeWorkHours ? named('workHours', client.get(`/v1/projects/${input.projectGuid}/workhours`, query)) : undefined,
-        input.includeFees ? named('projectFees', client.get(`/v1/projects/${input.projectGuid}/projectfees`, query)) : undefined,
-        input.includeInvoices ? named('invoiceSettings', client.get(`/v1/projects/${input.projectGuid}/projectinvoicesettings`, query)) : undefined,
-        input.includeTravelExpenses ? named('travelExpenses', client.get(`/v1/projects/${input.projectGuid}/projecttravelexpenses`, query)) : undefined,
-        input.includeFiles ? named('files', client.get(`/v1/projects/${input.projectGuid}/files`, query)) : undefined,
+        input.includeWorkHours ? named('workHours', client.get(`/v1/projects/${guidParam(input.projectGuid)}/workhours`, query)) : undefined,
+        input.includeFees ? named('projectFees', client.get(`/v1/projects/${guidParam(input.projectGuid)}/projectfees`, query)) : undefined,
+        input.includeInvoices ? named('invoiceSettings', client.get(`/v1/projects/${guidParam(input.projectGuid)}/projectinvoicesettings`, query)) : undefined,
+        input.includeTravelExpenses ? named('travelExpenses', client.get(`/v1/projects/${guidParam(input.projectGuid)}/projecttravelexpenses`, query)) : undefined,
+        input.includeFiles ? named('files', client.get(`/v1/projects/${guidParam(input.projectGuid)}/files`, query)) : undefined,
       ]);
       Object.assign(result, Object.fromEntries(entries.filter(Boolean) as Array<[string, unknown]>));
       return jsonToolResult(result);
@@ -291,7 +296,7 @@ export function registerSeveraTools(server: McpServer, client: SeveraClient): vo
       annotations: READ_TOOL_ANNOTATIONS,
     },
     async input => runAuditedTool('severa_search_workhours', input, async () => {
-      const path = input.userGuid ? `/v1/users/${input.userGuid}/workhours` : input.projectGuid ? `/v1/projects/${input.projectGuid}/workhours` : '/v1/workhours';
+      const path = input.userGuid ? `/v1/users/${guidParam(input.userGuid)}/workhours` : input.projectGuid ? `/v1/projects/${guidParam(input.projectGuid)}/workhours` : '/v1/workhours';
       const { userGuid: _userGuid, projectGuid: _projectGuid, ...query } = input;
       return jsonToolResult(await client.get(path, queryValues(query)));
     }),
@@ -311,7 +316,7 @@ export function registerSeveraTools(server: McpServer, client: SeveraClient): vo
       annotations: READ_TOOL_ANNOTATIONS,
     },
     async input => runAuditedTool('severa_search_time_entries', input, async () => {
-      const path = input.userGuid ? `/v1/users/${input.userGuid}/timeentries` : '/v1/timeentries';
+      const path = input.userGuid ? `/v1/users/${guidParam(input.userGuid)}/timeentries` : '/v1/timeentries';
       const { userGuid: _userGuid, ...query } = input;
       return jsonToolResult(await client.get(path, queryValues(query)));
     }),
@@ -371,11 +376,11 @@ export function registerSeveraTools(server: McpServer, client: SeveraClient): vo
         return jsonToolResult(await client.post('/v1/resourceallocations/allocations', query, input.criteria ?? {}));
       }
       const path = input.userGuid
-        ? `/v1/users/${input.userGuid}/resourceallocations/allocations`
+        ? `/v1/users/${guidParam(input.userGuid)}/resourceallocations/allocations`
         : input.projectGuid
-          ? `/v1/projects/${input.projectGuid}/resourceallocations/allocations`
+          ? `/v1/projects/${guidParam(input.projectGuid)}/resourceallocations/allocations`
           : input.phaseGuid
-            ? `/v1/phases/${input.phaseGuid}/resourceallocations/allocations`
+            ? `/v1/phases/${guidParam(input.phaseGuid)}/resourceallocations/allocations`
             : '/v1/resourceallocations';
       return jsonToolResult(await client.get(path, query));
     }),
@@ -414,7 +419,7 @@ export function registerSeveraTools(server: McpServer, client: SeveraClient): vo
     },
     async input => runAuditedTool('severa_search_activities', input, async () => {
       const path = input.collection === 'participants' && input.activityGuid
-        ? `/v1/activities/${input.activityGuid}/activityparticipants`
+        ? `/v1/activities/${guidParam(input.activityGuid)}/activityparticipants`
         : '/v1/activities';
       const { activityGuid: _activityGuid, collection: _collection, ...query } = input;
       return jsonToolResult(await client.get(path, queryValues(query)));
@@ -523,11 +528,13 @@ export function registerSeveraTools(server: McpServer, client: SeveraClient): vo
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
     async input => runAuditedTool('severa_commit_prepared_request', input, async () => {
-      const preparedRequest = {
-        ...input.preparedRequest,
-        query: queryValues(input.preparedRequest.query),
-      };
-      assertPreparedRequestHash(preparedRequest, input.confirmOperationHash);
+      const preparedRequest = verifyPreparedRequest(
+        {
+          ...input.preparedRequest,
+          query: queryValues(input.preparedRequest.query),
+        },
+        input.confirmOperationHash,
+      );
       const decision = await checkRequestPolicy(preparedRequest);
       if (!decision.allowed) {
         await writeAuditEvent({
@@ -622,28 +629,28 @@ function invoicePath(input: { invoiceGuid?: string; projectGuid?: string; collec
       projectfees: '/projectfees',
       travel_expenses: '/projecttravelexpenses',
     };
-    return `/v1/invoices/${input.invoiceGuid}${suffixes[input.collection] ?? ''}`;
+    return `/v1/invoices/${guidParam(input.invoiceGuid)}${suffixes[input.collection] ?? ''}`;
   }
   if (input.projectGuid && input.collection === 'settings') {
-    return `/v1/projects/${input.projectGuid}/projectinvoicesettings`;
+    return `/v1/projects/${guidParam(input.projectGuid)}/projectinvoicesettings`;
   }
   return input.collection === 'rows' ? '/v1/invoicerows' : '/v1/invoices';
 }
 
 function feePath(input: { projectGuid?: string; userGuid?: string; collection: string }): string {
   if (input.collection === 'flatrates') {
-    return input.projectGuid ? `/v1/projects/${input.projectGuid}/flatrates` : '/v1/flatrates';
+    return input.projectGuid ? `/v1/projects/${guidParam(input.projectGuid)}/flatrates` : '/v1/flatrates';
   }
   if (input.collection === 'recurringfeerules') {
-    return input.projectGuid ? `/v1/projects/${input.projectGuid}/projectrecurringfeerules` : '/v1/projectrecurringfeerules';
+    return input.projectGuid ? `/v1/projects/${guidParam(input.projectGuid)}/projectrecurringfeerules` : '/v1/projectrecurringfeerules';
   }
   if (input.collection === 'deletedprojectfees') {
     return '/v1/deletedprojectfees';
   }
   if (input.userGuid) {
-    return `/v1/users/${input.userGuid}/projectfees`;
+    return `/v1/users/${guidParam(input.userGuid)}/projectfees`;
   }
-  return input.projectGuid ? `/v1/projects/${input.projectGuid}/projectfees` : '/v1/projectfees';
+  return input.projectGuid ? `/v1/projects/${guidParam(input.projectGuid)}/projectfees` : '/v1/projectfees';
 }
 
 function travelPath(input: { projectGuid?: string; userGuid?: string; travelReimbursementGuid?: string; collection: string }): string {
@@ -654,12 +661,12 @@ function travelPath(input: { projectGuid?: string; userGuid?: string; travelReim
     return '/v1/deletedprojecttravelexpenses';
   }
   if (input.travelReimbursementGuid) {
-    return `/v1/travelreimbursements/${input.travelReimbursementGuid}/projecttravelexpenses`;
+    return `/v1/travelreimbursements/${guidParam(input.travelReimbursementGuid)}/projecttravelexpenses`;
   }
   if (input.userGuid) {
-    return `/v1/users/${input.userGuid}/projecttravelexpenses`;
+    return `/v1/users/${guidParam(input.userGuid)}/projecttravelexpenses`;
   }
-  return input.projectGuid ? `/v1/projects/${input.projectGuid}/projecttravelexpenses` : '/v1/projecttravelexpenses';
+  return input.projectGuid ? `/v1/projects/${guidParam(input.projectGuid)}/projecttravelexpenses` : '/v1/projecttravelexpenses';
 }
 
 function userPath(input: { userGuid?: string; date?: string; collection: string }): string {
@@ -667,15 +674,15 @@ function userPath(input: { userGuid?: string; date?: string; collection: string 
     return input.collection === 'workdays' ? '/v1/workdays' : '/v1/users';
   }
   const paths: Record<string, string> = {
-    users: `/v1/users/${input.userGuid}`,
-    workdays: `/v1/users/${input.userGuid}/workdays`,
-    workcontracts: `/v1/users/${input.userGuid}/workcontracts`,
-    current_workcontract: `/v1/users/${input.userGuid}/workcontracts/current`,
-    flextime: `/v1/users/${input.userGuid}/flextime`,
-    flextimeadjustments: `/v1/users/${input.userGuid}/flextimeadjustments`,
-    customvalues: `/v1/users/${input.userGuid}/customvalues`,
+    users: `/v1/users/${guidParam(input.userGuid)}`,
+    workdays: `/v1/users/${guidParam(input.userGuid)}/workdays`,
+    workcontracts: `/v1/users/${guidParam(input.userGuid)}/workcontracts`,
+    current_workcontract: `/v1/users/${guidParam(input.userGuid)}/workcontracts/current`,
+    flextime: `/v1/users/${guidParam(input.userGuid)}/flextime`,
+    flextimeadjustments: `/v1/users/${guidParam(input.userGuid)}/flextimeadjustments`,
+    customvalues: `/v1/users/${guidParam(input.userGuid)}/customvalues`,
   };
-  return paths[input.collection] ?? `/v1/users/${input.userGuid}`;
+  return paths[input.collection] ?? `/v1/users/${guidParam(input.userGuid)}`;
 }
 
 function filePath(input: {
@@ -689,21 +696,21 @@ function filePath(input: {
 }): string {
   switch (input.collection) {
     case 'customer_files':
-      return input.customerGuid ? `/v1/customers/${input.customerGuid}/files` : '/v1/customerfiles';
+      return input.customerGuid ? `/v1/customers/${guidParam(input.customerGuid)}/files` : '/v1/customerfiles';
     case 'invoice_files':
-      return input.invoiceGuid ? `/v1/invoices/${input.invoiceGuid}/files` : '/v1/invoicefiles';
+      return input.invoiceGuid ? `/v1/invoices/${guidParam(input.invoiceGuid)}/files` : '/v1/invoicefiles';
     case 'travel_expense_files':
-      return input.projectTravelExpenseGuid ? `/v1/projecttravelexpenses/${input.projectTravelExpenseGuid}/files` : '/v1/projecttravelexpensefiles';
+      return input.projectTravelExpenseGuid ? `/v1/projecttravelexpenses/${guidParam(input.projectTravelExpenseGuid)}/files` : '/v1/projecttravelexpensefiles';
     case 'file':
-      return `/v1/files/${input.fileGuid}`;
+      return `/v1/files/${guidParam(input.fileGuid)}`;
     case 'filedata':
-      return `/v1/files/${input.fileGuid}/filedata`;
+      return `/v1/files/${guidParam(input.fileGuid)}/filedata`;
     case 'invoice_pdf':
-      return `/v1/invoices/${input.invoiceGuid}/pdf`;
+      return `/v1/invoices/${guidParam(input.invoiceGuid)}/pdf`;
     case 'travel_reimbursement_pdf':
-      return `/v1/travelreimbursements/${input.travelReimbursementGuid}/pdf`;
+      return `/v1/travelreimbursements/${guidParam(input.travelReimbursementGuid)}/pdf`;
     default:
-      return input.projectGuid ? `/v1/projects/${input.projectGuid}/files` : '/v1/projectfiles';
+      return input.projectGuid ? `/v1/projects/${guidParam(input.projectGuid)}/files` : '/v1/projectfiles';
   }
 }
 

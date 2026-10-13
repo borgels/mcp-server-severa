@@ -1,6 +1,6 @@
 import { catalogMetadata, getSchema, searchCapabilities } from './severa/capabilities.js';
 import { SeveraClient, type SeveraClientOptions, type SeveraQueryValue } from './severa/client.js';
-import { assertAllowedReadOperation } from './severa/requests.js';
+import { assertAllowedReadOperation, guidParam } from './severa/requests.js';
 
 export type GatewayRiskLevel = 'read' | 'write' | 'destructive';
 export type GatewayJsonValue = string | number | boolean | null | GatewayJsonValue[] | { [key: string]: GatewayJsonValue };
@@ -161,7 +161,7 @@ export function createSeveraGateway(options: SeveraGatewayOptions = {}) {
           return jsonResult('Fetched Severa customers.', await client.get('/v1/customers', queryValues(input)));
 
         case 'get_customer':
-          return jsonResult('Fetched Severa customer.', await client.get(`/v1/customers/${requiredString(input.customerGuid, 'customerGuid')}`));
+          return jsonResult('Fetched Severa customer.', await client.get(`/v1/customers/${guidParam(requiredString(input.customerGuid, 'customerGuid'))}`));
 
         case 'search_projects': {
           const path = input.salesCases === true ? '/v1/salescases' : '/v1/projects';
@@ -169,7 +169,7 @@ export function createSeveraGateway(options: SeveraGatewayOptions = {}) {
         }
 
         case 'get_project':
-          return jsonResult('Fetched Severa project.', await client.get(`/v1/projects/${requiredString(input.projectGuid, 'projectGuid')}`));
+          return jsonResult('Fetched Severa project.', await client.get(`/v1/projects/${guidParam(requiredString(input.projectGuid, 'projectGuid'))}`));
 
         case 'rest_read': {
           const method = (stringValue(input.method) ?? 'GET').toUpperCase() as 'GET' | 'POST';
