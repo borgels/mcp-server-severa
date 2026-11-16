@@ -72,3 +72,44 @@ describe('SeveraClient', () => {
     expect(redactSecrets('SEVERA_CLIENT_SECRET=abc Authorization: Bearer xyz')).toContain('[REDACTED]');
   });
 });
+
+describe('SeveraClient hardening', () => {
+  const savedTimeout = process.env.SEVERA_TIMEOUT_MS;
+  afterEach(() => {
+    if (savedTimeout === undefined) {
+      delete process.env.SEVERA_TIMEOUT_MS;
+    } else {
+      process.env.SEVERA_TIMEOUT_MS = savedTimeout;
+    }
+  });
+
+  it('never follows redirects and reports them as errors', async () => {
+    const calls: RequestInit[] = [];
+    const client = new SeveraClient({
+      clientId: 'id', clientSecret: 'secret-value',
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        calls.push(init);
+        return new Response(null, { status: 302, headers: { location: 'https://elsewhere.example/' } });
+      }) as unknown as typeof fetch,
+    });
+    await expect(client.get('/v1/customers')).rejects.toThrow(/302/);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every(init => init.redirect === 'manual')).toBe(true);
+  });
+
+  it('reads at most 64 KB of an error body', async () => {
+    const client = new SeveraClient({
+      clientId: 'id', clientSecret: 'secret-value',
+      fetchImpl: (async () => new Response('x'.repeat(1_000_000), { status: 500 })) as unknown as typeof fetch,
+    });
+    const error = (await client.get('/v1/customers').catch((e: unknown) => e)) as Error;
+    expect(error.message.length).toBeLessThan(70_000);
+  });
+
+  it('rejects an invalid SEVERA_TIMEOUT_MS instead of using NaN', () => {
+    process.env.SEVERA_TIMEOUT_MS = '30s';
+    expect(() => new SeveraClient()).toThrow(/SEVERA_TIMEOUT_MS/);
+    process.env.SEVERA_TIMEOUT_MS = '5000';
+    expect(() => new SeveraClient()).not.toThrow();
+  });
+});
