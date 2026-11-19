@@ -10,9 +10,9 @@ import { nestedFailuresAsStatus } from '../src/errors.js';
 import { visibleTexts } from '../src/key-admission.js';
 
 const BASE = 'https://severa.example.test/rest-api';
-const ID = 'Ka7Rq2Wm9Xb4Lz6Tc1';
-const SECRET = 'Sa8Pv3Nh5Jd2Yf7Qk4Gw';
-const ISSUED = 'Ta4Qz8Kx1Wn7Vb3Mr6Yd';
+const ID = 'qqqqwwwwzzzzxxxx1';
+const SECRET = 'jjjjkkkkvvvvyyyy2';
+const ISSUED = 'ttttuuuuffffhhhh5';
 const CREDS = { clientId: ID, clientSecret: SECRET };
 let dir: string;
 

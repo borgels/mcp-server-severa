@@ -17,12 +17,12 @@ import { registerSeveraTools } from '../src/tools/severa.js';
 import { SeveraClient } from '../src/severa/client.js';
 import { SEVERA_OPERATIONS } from '../src/severa/openapi-catalog.js';
 
-const ID_A = 'Ka7Rq2Wm9Xb4Lz6Tc1';
-const SECRET_A = 'Sa8Pv3Nh5Jd2Yf7Qk4Gw';
-const ID_B = 'Kb3Mw8Rt1Vc6Hn9Zp2';
-const SECRET_B = 'Sb5Lq9Xd2Wf6Tj3Rm8Ph';
-const ISSUED_A = 'Ta4Qz8Kx1Wn7Vb3Mr6Yd';
-const ISSUED_B = 'Tb9Hc2Lp5Rs8Fg1Nk4Ju';
+const ID_A = 'qqqqwwwwzzzzxxxx1';
+const SECRET_A = 'jjjjkkkkvvvvyyyy2';
+const ID_B = 'qqqqwwwwzzzzxxxx3';
+const SECRET_B = 'jjjjkkkkvvvvyyyy4';
+const ISSUED_A = 'ttttuuuuffffhhhh5';
+const ISSUED_B = 'ttttuuuuffffhhhh6';
 const BASE = 'https://severa.example.test/rest-api';
 const GUID = '3f1c2a4e-5b6d-4c7e-8f90-1a2b3c4d5e6f';
 const A = { clientId: ID_A, clientSecret: SECRET_A };
