@@ -1,36 +1,105 @@
+/**
+ * Errors and redaction.
+ *
+ * The rule: no text Severa controls ever reaches a host, a result or an audit
+ * record through an error. An HTTP error carries the status, our own hint and
+ * the parsed Retry-After; never a response body, an error message from
+ * Severa, a request id, or a redirect's Location. Severa's text can quote the
+ * request or part of a credential, and no redactor recognises every fragment.
+ *
+ * Redaction is the second line: the secrets of the instance in scope (the
+ * client id and secret, and every access token Severa issued to it: exact
+ * values, encoded forms and any fragment of FRAGMENT_LENGTH characters or
+ * more) are redacted from everything returned, on structured values before
+ * they are serialised.
+ */
+import { redactRegisteredSecrets } from './upstream-http.js';
+
+export { FRAGMENT_LENGTH, MIN_SECRET_LENGTH } from './upstream-http.js';
+
+/** Values nested deeper than this are replaced by redactDeep, never passed on. */
+export const MAX_REDACT_DEPTH = 64;
+
 export interface SeveraHttpErrorInput {
   status: number;
   method: string;
   url: string;
-  payload?: unknown;
   retryAfter?: string;
   requestId?: string;
-  fallbackMessage?: string;
+  /** True for the client-credentials token request (`POST /v1/login/oauth/token`). */
+  tokenRequest?: boolean;
 }
 
 const SECRET_PATTERNS = [
+  // Bearer or Basic, in any case, before a value that holds the marker of an earlier redaction: the scheme word and the
+  // whole value up to a space, quote, comma or brace, whatever its length (a short tail after the marker is still part
+  // of the credential).
+  /\b(bearer|basic)\s+[^\s"',}]*‹redacted›[^\s"',}]*/gi,
   /Authorization:\s*(Bearer|Basic)\s+[^,\s}]+/gi,
-  /(SEVERA_CLIENT_ID|SEVERA_CLIENT_SECRET|SEVERA_ACCESS_TOKEN|SEVERA_REFRESH_TOKEN|client_secret|clientSecret|access_token|refresh_token|apiKey|accessToken|token)["']?\s*[:=]\s*["']?[^"',\s}]+/gi,
-  /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/-]+=*/g,
+  // A credential-named assignment in text: `X-Api-Key: S`, `client_secret=S`, `?api_key=S`, `"accessToken": "S"`.
+  /(SEVERA_CLIENT_ID|SEVERA_CLIENT_SECRET|SEVERA_ACCESS_TOKEN|SEVERA_REFRESH_TOKEN|(?:x[-_]?)?api[-_]?(?:key|token|secret)|client[-_]?secret|(?:access|refresh|auth|id|session|bearer)[-_]?token|accessToken|apiKey|token|password|passwd|secret)["']?\s*[:=]\s*["']?[^"',\s}&]+/gi,
+  // A marker left by the secrets' redaction (‹redacted›) counts as part of a value, so the rest of it is masked too.
+  /\b(Bearer|Basic)\s+(?:[A-Za-z0-9._~+/-]|‹redacted›)+=*/g,
+  // Any case ("bearer", "BASIC"), when what follows looks like a token: 8 or more base64 or base64url characters. A
+  // short word after "basic" ("basic plan") is left alone; a longer one is masked, a false positive we accept.
+  /\b(bearer|basic)\s+(?:[A-Za-z0-9._~+/-]|‹redacted›){8,}=*/gi,
+  // A JSON Web Token anywhere: three base64url segments, the first a JSON header ("eyJ").
+  /\beyJ(?:[A-Za-z0-9_-]|‹redacted›)*\.(?:[A-Za-z0-9_-]|‹redacted›)+\.(?:[A-Za-z0-9_-]|‹redacted›)*/g,
 ];
 
+/** Our own guidance per HTTP status. */
+const STATUS_HINTS: Record<number, string> = {
+  401: 'Severa rejected the access token (expired or revoked). A new token is requested on the next call.',
+  403: 'The Severa client has no access to this (scope or user rights). Retrying will not help.',
+  404: 'Severa found nothing at this address. Check the ids.',
+  429: 'Severa is throttling requests. Wait and retry later.',
+};
+
+/** Our own guidance for a failed client-credentials token request. */
+function tokenHint(status: number): string {
+  if (status === 429) return STATUS_HINTS[429]!;
+  if (status === 400 || status === 401 || status === 403) {
+    return 'Severa refused the client credentials (invalid, revoked, or without the requested scope). Retrying will not help.';
+  }
+  return 'Severa could not issue an access token.';
+}
+
+/**
+ * An HTTP error from Severa: the status, our own hint and the parsed
+ * Retry-After. Nothing of the body is kept. The request id header is kept as
+ * a property for diagnostics, never in the message.
+ */
 export class SeveraHttpError extends Error {
   readonly status: number;
   readonly method: string;
   readonly url: string;
-  readonly payload?: unknown;
+  /** Seconds to wait, parsed from Retry-After; undefined when absent or not a number of seconds. */
   readonly retryAfter?: string;
   readonly requestId?: string;
+  readonly tokenRequest: boolean;
 
   constructor(input: SeveraHttpErrorInput) {
-    super(formatSeveraHttpError(input));
+    const retryAfter = wholeNumber(input.retryAfter);
+    super(
+      [
+        `Severa API request failed with HTTP ${input.status}`,
+        input.tokenRequest
+          ? tokenHint(input.status)
+          : Object.hasOwn(STATUS_HINTS, input.status)
+            ? STATUS_HINTS[input.status]
+            : undefined,
+        retryAfter === undefined ? undefined : `retry-after=${retryAfter}s`,
+      ]
+        .filter(Boolean)
+        .join(' | '),
+    );
     this.name = 'SeveraHttpError';
     this.status = input.status;
     this.method = input.method;
-    this.url = redactSecrets(input.url);
-    this.payload = input.payload;
-    this.retryAfter = input.retryAfter;
+    this.url = input.url;
+    this.retryAfter = retryAfter;
     this.requestId = input.requestId;
+    this.tokenRequest = input.tokenRequest === true;
   }
 }
 
@@ -42,10 +111,36 @@ export function formatUnknownError(error: unknown): string {
   return redactSecrets(String(error));
 }
 
+/**
+ * Credential-shaped text first, while it is whole: an instance secret replaced inside a Basic value or a token would
+ * break the match and leave the rest of the value. Then the instance's secrets, then the patterns again (they also take
+ * the marker as part of a value), until nothing changes.
+ */
 export function redactSecrets(value: string): string {
+  let result = redactCredentialPatterns(value);
+  for (let round = 0; round < 4; round += 1) {
+    const next = redactCredentialPatterns(redactRegisteredSecrets(result));
+    if (next === result) break;
+    result = next;
+  }
+  return result;
+}
+
+/**
+ * Credential-shaped text replaced by a marker: an Authorization header, a
+ * Bearer or Basic value, and `token=`/`apiKey:`-style assignments. Applied to
+ * every text a gateway returns, so a credential the upstream echoes (one that
+ * is not the instance's own key, such as a session token) never leaves it.
+ * Uses no state: the same input always gives the same output.
+ */
+export function redactCredentialPatterns(value: string): string {
   return SECRET_PATTERNS.reduce(
     (current, pattern) =>
       current.replace(pattern, match => {
+        if (/^eyJ/.test(match)) {
+          return '[REDACTED]';
+        }
+
         if (/^(Bearer|Basic)\s/i.test(match)) {
           const scheme = match.split(/\s+/)[0] ?? 'Authorization';
           return `${scheme} [REDACTED]`;
@@ -55,40 +150,136 @@ export function redactSecrets(value: string): string {
           return 'Authorization: [REDACTED]';
         }
 
-        const separator = match.includes(':') ? ':' : '=';
-        const key = match.split(separator)[0]?.trim() ?? 'secret';
-        return `${key}${separator} [REDACTED]`;
+        // The first separator ends the name: everything after it is the value, which may itself hold `:` or `=`.
+        const [, key = 'secret', separator = ':'] = /^(.*?)\s*([:=])/.exec(match) ?? [];
+        return `${key.trim()}${separator} [REDACTED]`;
       }),
     value,
   );
 }
 
-function formatSeveraHttpError(input: SeveraHttpErrorInput): string {
-  const parts = [
-    `Severa API request failed with HTTP ${input.status}`,
-    `${input.method.toUpperCase()} ${redactSecrets(input.url)}`,
-    input.requestId ? `request-id=${input.requestId}` : undefined,
-    input.retryAfter ? `retry-after=${input.retryAfter}s` : undefined,
-    severaErrorText(input.payload),
-    input.fallbackMessage,
-  ].filter(Boolean);
-
-  return redactSecrets(parts.join(' | '));
+/**
+ * Copy of a JSON-like value with every string, object keys included, passed
+ * through redactSecrets. Redact a value with this before it is serialised:
+ * a serialised secret is escaped, and the escaped form is easy to miss.
+ * Anything nested deeper than MAX_REDACT_DEPTH is replaced, never passed on.
+ */
+export function redactDeep(value: unknown, depth = 0): unknown {
+  if (depth > MAX_REDACT_DEPTH) {
+    return '[nested too deep]';
+  }
+  if (typeof value === 'string') {
+    return redactSecrets(value);
+  }
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+    // The string form of a primitive is checked too; a match becomes the string "‹redacted›", so JSON stays valid.
+    const text = String(value);
+    if (redactSecrets(text) !== text) return '‹redacted›';
+    return typeof value === 'bigint' ? text : value;
+  }
+  if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+  const json = (value as { toJSON?: unknown }).toJSON;
+  if (typeof json === 'function') {
+    return redactDeep(json.call(value), depth + 1);
+  }
+  if (Array.isArray(value)) {
+    return value.map(entry => redactDeep(entry, depth + 1));
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [redactSecrets(key), redactDeep(entry, depth + 1)]),
+  );
 }
 
-function severaErrorText(payload: unknown): string | undefined {
-  if (!payload || typeof payload !== 'object') {
-    return undefined;
+/** Copy of parsed JSON with anything nested deeper than MAX_REDACT_DEPTH replaced, so it can be serialised safely. */
+export function limitDepth(value: unknown, depth = 0): unknown {
+  if (depth > MAX_REDACT_DEPTH) {
+    return '[nested too deep]';
   }
+  if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map(entry => limitDepth(entry, depth + 1));
+  }
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, limitDepth(entry, depth + 1)]));
+}
 
-  const value = payload as Record<string, unknown>;
-  const message =
-    value.message ??
-    value.error ??
-    value.error_description ??
-    value.errorMessage ??
-    value.title ??
-    (Array.isArray(value.errors) ? value.errors.map(String).join(', ') : undefined);
+/** Keys whose value is a failure context: anything inside that carries an error or a message is a failure. */
+const FAILURE_CONTEXTS = new Set(['failures', 'failure', 'errors', 'error', 'metadata', 'warnings', 'amount']);
+/** Fields that make an object in a failure context a failure. */
+const FAILURE_FIELDS = ['error', 'errors', 'failures', 'warnings', 'message', 'detail', 'description'];
+/** Failure lists: every element in one is a failure, whatever its fields. */
+const FAILURE_LISTS = new Set(['failures', 'failure', 'errors', 'error', 'warnings']);
 
-  return typeof message === 'string' ? message : undefined;
+/** One element of a failure list, reduced to a numeric status (when it has one) and our own text. */
+function failureEntry(value: unknown): { status?: number; message: string } {
+  const status =
+    typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>).status : undefined;
+  return typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599
+    ? { status, message: `Severa reported a failure with HTTP ${status}.` }
+    : { message: 'Severa reported a failure.' };
+}
+
+/** A failure list: every element (an object with any fields, a text, a list) becomes a failureEntry. */
+function failureList(value: unknown): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  return Array.isArray(value) ? value.map(failureEntry) : failureEntry(value);
+}
+
+/**
+ * Copy of a successful body with every failure reported inside it reduced to
+ * its HTTP status and our own text.
+ *
+ * - Every element of a failure list (`failures`, `failure`, `errors`,
+ *   `error`, `warnings`), at any depth, becomes `{ status?, message }`: a
+ *   numeric status is kept, and every other field, whatever its name, is
+ *   dropped. Nothing below a failure list is kept.
+ * - Elsewhere a failure is an object with a numeric `status` of 400 or
+ *   more, an object with an `error` field, or an object in a failure
+ *   context (`metadata`, `amount` and the like, also through wrappers such
+ *   as `data` below them) with any of `error`, `errors`, `failures`,
+ *   `warnings`, `message`, `detail` or `description`. It becomes
+ *   `{ status?, error }` with our own text.
+ *
+ * A text outside a failure list, an amount among them, is kept.
+ * Depth-limited.
+ */
+export function nestedFailuresAsStatus(value: unknown, depth = 0, context = false): unknown {
+  if (depth > MAX_REDACT_DEPTH) {
+    return '[nested too deep]';
+  }
+  if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map(entry => nestedFailuresAsStatus(entry, depth + 1, context));
+  }
+  const record = value as Record<string, unknown>;
+  const status = record.status;
+  const failedStatus = typeof status === 'number' && Number.isInteger(status) && status >= 400 && status <= 599;
+  const present = (field: string) => Object.hasOwn(record, field) && record[field] !== null && record[field] !== undefined;
+  if (failedStatus || present('error') || (context && FAILURE_FIELDS.some(present))) {
+    return failedStatus
+      ? { status, error: `Severa reported a failure with HTTP ${status}.` }
+      : { error: 'Severa reported a failure.' };
+  }
+  return Object.fromEntries(
+    Object.entries(record).map(([key, entry]) => [
+      key,
+      FAILURE_LISTS.has(key)
+        ? failureList(entry)
+        : // A failure context holds through wrappers such as `data` below it.
+          nestedFailuresAsStatus(entry, depth + 1, context || FAILURE_CONTEXTS.has(key)),
+    ]),
+  );
+}
+
+/** A header value that is a whole number of at most 9 digits, as text; anything else is dropped. */
+function wholeNumber(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed && /^\d{1,9}$/.test(trimmed) ? String(Number(trimmed)) : undefined;
 }

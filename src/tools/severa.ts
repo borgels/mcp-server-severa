@@ -14,6 +14,7 @@ import {
 } from '../severa/capabilities.js';
 import { type SeveraClient, type SeveraHttpMethod, type SeveraQueryValue, paginationQuery } from '../severa/client.js';
 import { checkRequestPolicy, checkToolPolicy } from '../severa/policy.js';
+import { currentOfferedTools } from '../severa/scope.js';
 import {
   assertAllowedReadOperation,
   guidParam,
@@ -63,7 +64,7 @@ export function registerSeveraTools(server: McpServer, client: SeveraClient): vo
       },
       annotations: READ_TOOL_ANNOTATIONS,
     },
-    async input => runAuditedTool('severa_search_capabilities', input, async () => jsonToolResult(searchCapabilities(input.query, input.limit))),
+    async input => runAuditedTool('severa_search_capabilities', input, async () => jsonToolResult(searchCapabilities(input.query, input.limit, currentOfferedTools()))),
   );
 
   server.registerTool(
@@ -580,7 +581,8 @@ async function runAuditedTool<T>(
     await writeAuditEvent({ tool, action: 'finish', target, status: 'ok', ...auditOptions });
     return result;
   } catch (error) {
-    await writeAuditEvent({ tool, action: 'error', target, status: 'error', error: formatUnknownError(error), ...auditOptions });
+    // The error object itself: the audit classifies it into a fixed code (http_<status>, timeout or error).
+    await writeAuditEvent({ tool, action: 'error', target, status: 'error', error, ...auditOptions });
     throw error;
   }
 }
