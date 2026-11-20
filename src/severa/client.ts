@@ -1,9 +1,13 @@
 import { readEnvInteger } from '../config-env.js';
-import { SeveraHttpError } from '../errors.js';
+import { limitDepth, nestedFailuresAsStatus, SeveraHttpError } from '../errors.js';
+import { describeUrl, discardBody, isRedirect, registerSecret, SecretRedactor } from '../upstream-http.js';
 import { SEVERA_DEFAULT_BASE_URL } from './openapi-catalog.js';
 
 export type SeveraHttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 export type SeveraQueryValue = string | number | boolean | null | undefined | Array<string | number | boolean>;
+
+/** The client-credentials token request, relative to the base URL. It is an upstream request like any other. */
+export const TOKEN_PATH = '/v1/login/oauth/token';
 
 export interface SeveraClientOptions {
   clientId?: string;
@@ -13,6 +17,18 @@ export interface SeveraClientOptions {
   baseUrl?: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  /**
+   * Where a missing clientId, clientSecret, scope, accessToken, baseUrl or
+   * timeout is read from. Default process.env (the MCP server). The gateway
+   * passes {}: an embedded instance never reads the environment.
+   */
+  credentialEnv?: Readonly<Record<string, string | undefined>>;
+  /**
+   * The instance's own redactor (the gateway). Without one the credentials,
+   * and every access token Severa issues, are redacted by the MCP server's
+   * process-wide redactor.
+   */
+  redactor?: SecretRedactor;
 }
 
 export interface SeveraRequest {
@@ -28,11 +44,9 @@ export interface SeveraResponse<T = unknown> {
   status: number;
 }
 
-interface OAuthToken {
-  access_token?: string;
-  token_type?: string;
-  expires_in?: number;
-  refresh_token?: string;
+interface CachedToken {
+  accessToken: string;
+  expiresAt: number;
   scope?: string;
 }
 
@@ -44,17 +58,30 @@ export class SeveraClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
-  private cachedToken?: { accessToken: string; expiresAt: number; scope?: string };
+  private readonly ownRedactor: boolean;
+  /** This client's token: never shared with another client, so never with another gateway instance. */
+  private cachedToken?: CachedToken;
+  private pendingToken?: Promise<CachedToken>;
+
+  /** Redacts this client's credentials and the access tokens Severa issued to it. */
+  readonly redactor: SecretRedactor;
 
   constructor(options: SeveraClientOptions = {}) {
-    this.clientId = options.clientId ?? process.env.SEVERA_CLIENT_ID;
-    this.clientSecret = options.clientSecret ?? process.env.SEVERA_CLIENT_SECRET;
-    this.scope = options.scope ?? process.env.SEVERA_SCOPE;
-    this.staticAccessToken = options.accessToken ?? process.env.SEVERA_ACCESS_TOKEN;
-    this.baseUrl = trimTrailingSlash(options.baseUrl ?? process.env.SEVERA_BASE_URL ?? SEVERA_DEFAULT_BASE_URL);
+    const env = options.credentialEnv ?? process.env;
+    this.clientId = options.clientId ?? env.SEVERA_CLIENT_ID;
+    this.clientSecret = options.clientSecret ?? env.SEVERA_CLIENT_SECRET;
+    this.scope = options.scope ?? env.SEVERA_SCOPE;
+    this.staticAccessToken = options.accessToken ?? env.SEVERA_ACCESS_TOKEN;
+    this.redactor = options.redactor ?? new SecretRedactor();
+    this.ownRedactor = !options.redactor;
+    for (const secret of [this.clientId, this.clientSecret, this.staticAccessToken]) {
+      this.addSecret(secret);
+    }
+    this.baseUrl = trimTrailingSlash(options.baseUrl ?? env.SEVERA_BASE_URL ?? SEVERA_DEFAULT_BASE_URL);
     assertSafeBaseUrl(this.baseUrl);
     this.fetchImpl = options.fetchImpl ?? fetch;
-    this.timeoutMs = options.timeoutMs ?? readEnvInteger('SEVERA_TIMEOUT_MS', 30_000, { min: 1, max: 600_000 });
+    this.timeoutMs =
+      options.timeoutMs ?? readEnvInteger('SEVERA_TIMEOUT_MS', 30_000, { min: 1, max: 600_000 }, env);
   }
 
   async get<T = unknown>(path: string, query?: Record<string, SeveraQueryValue>): Promise<SeveraResponse<T>> {
@@ -71,45 +98,43 @@ export class SeveraClient {
 
   async request<T = unknown>(request: SeveraRequest): Promise<SeveraResponse<T>> {
     const url = this.url(request.path, request.query);
+    const accessToken = await this.accessToken();
     const headers: Record<string, string> = {
       Accept: 'application/json',
-      Authorization: `Bearer ${await this.accessToken()}`,
+      Authorization: `Bearer ${accessToken}`,
     };
 
     if (request.body !== undefined) {
       headers['Content-Type'] = 'application/json';
     }
 
-    const response = await this.fetchImpl(url, {
+    const response = await this.send(url, {
       method: request.method,
       headers,
       body: request.body === undefined ? undefined : JSON.stringify(request.body),
-      // Never follow redirects: credentials must only reach the configured API origin.
-      redirect: 'manual',
-      signal: AbortSignal.timeout(this.timeoutMs),
     });
 
-    const responseBody = await readResponseBody(response);
-
     if (!response.ok) {
+      // The body is Severa's text: it is never read into an error, a result or an audit record.
+      await discardBody(response);
+      if (response.status === 401 && this.cachedToken?.accessToken === accessToken) {
+        // A rejected token is not used again: the next call asks for a new one.
+        this.cachedToken = undefined;
+      }
       throw new SeveraHttpError({
         status: response.status,
         method: request.method,
-        url,
-        payload: responseBody,
+        url: describeUrl(url),
         retryAfter: response.headers.get('retry-after') ?? undefined,
-        requestId:
-          response.headers.get('x-request-id') ??
-          response.headers.get('request-id') ??
-          response.headers.get('traceparent') ??
-          undefined,
-        fallbackMessage: typeof responseBody === 'string' ? responseBody : undefined,
+        requestId: response.headers.get('x-request-id') ?? response.headers.get('request-id') ?? undefined,
       });
     }
 
+    // A failure reported inside a successful answer keeps only its status and our own text.
+    const data = nestedFailuresAsStatus(await readResponseBody(response, request.method)) as T;
     return {
-      data: responseBody as T,
-      nextPageToken: response.headers.get('NextPageToken') ?? response.headers.get('nextpagetoken') ?? undefined,
+      data,
+      nextPageToken: response.headers.get('NextPageToken') ?? undefined,
       status: response.status,
     };
   }
@@ -119,7 +144,7 @@ export class SeveraClient {
       return { authMethod: 'access_token' };
     }
 
-    const token = await this.fetchClientCredentialsToken();
+    const token = await this.clientCredentialsToken();
     return {
       authMethod: 'client_credentials',
       scope: token.scope,
@@ -127,26 +152,66 @@ export class SeveraClient {
     };
   }
 
+  private addSecret(secret: string | undefined): void {
+    this.redactor.addSecret(secret);
+    if (this.ownRedactor) {
+      // The MCP server: its errors are redacted outside any call scope.
+      registerSecret(secret);
+    }
+  }
+
+  /** One fetch to Severa: redirects are never followed, and a network failure or timeout is worded by us. */
+  private async send(url: string, init: RequestInit): Promise<Response> {
+    const method = String(init.method ?? 'GET');
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, {
+        ...init,
+        // Never follow redirects: credentials must only reach the configured API origin.
+        redirect: 'manual',
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch (error) {
+      throw transportError(error, method, this.timeoutMs);
+    }
+    if (isRedirect(response.status)) {
+      // The Location is Severa's text and is never quoted, and the address is configuration.
+      await discardBody(response);
+      throw new Error(
+        `Severa API responded with a redirect (HTTP ${response.status}) for ${method}; ` +
+          'redirects are not followed, so credentials are never sent to another host. Check the configured base URL.',
+      );
+    }
+    return response;
+  }
+
   private async accessToken(): Promise<string> {
     if (this.staticAccessToken) {
       return this.staticAccessToken;
     }
 
-    return (await this.fetchClientCredentialsToken()).accessToken;
+    return (await this.clientCredentialsToken()).accessToken;
   }
 
-  private async fetchClientCredentialsToken(): Promise<{ accessToken: string; expiresAt: number; scope?: string }> {
-    const now = Date.now();
-    if (this.cachedToken && this.cachedToken.expiresAt - now > 60_000) {
+  /** The cached token while it has more than a minute left; otherwise one new request, shared by concurrent calls. */
+  private async clientCredentialsToken(): Promise<CachedToken> {
+    if (this.cachedToken && this.cachedToken.expiresAt - Date.now() > 60_000) {
       return this.cachedToken;
     }
+    this.pendingToken ??= this.fetchClientCredentialsToken().finally(() => {
+      this.pendingToken = undefined;
+    });
+    return this.pendingToken;
+  }
 
+  private async fetchClientCredentialsToken(): Promise<CachedToken> {
     if (!this.clientId || !this.clientSecret) {
       throw new Error('Missing Severa credentials. Set SEVERA_CLIENT_ID and SEVERA_CLIENT_SECRET, or set SEVERA_ACCESS_TOKEN.');
     }
 
-    const url = `${this.baseUrl}/v1/login/oauth/token`;
-    const response = await this.fetchImpl(url, {
+    const now = Date.now();
+    const url = `${this.baseUrl}${TOKEN_PATH}`;
+    const response = await this.send(url, {
       method: 'POST',
       headers: {
         Accept: 'application/json',
@@ -158,31 +223,39 @@ export class SeveraClient {
         client_secret: this.clientSecret,
         scope: this.scope,
       }),
-      // Never follow redirects: credentials must only reach the configured API origin.
-      redirect: 'manual',
-      signal: AbortSignal.timeout(this.timeoutMs),
     });
 
-    const responseBody = await readResponseBody(response);
     if (!response.ok) {
+      // The body is Severa's text, and may echo the credentials: never read.
+      await discardBody(response);
       throw new SeveraHttpError({
         status: response.status,
         method: 'POST',
-        url,
-        payload: responseBody,
-        fallbackMessage: typeof responseBody === 'string' ? responseBody : undefined,
+        url: describeUrl(url),
+        retryAfter: response.headers.get('retry-after') ?? undefined,
+        tokenRequest: true,
       });
     }
 
-    const token = responseBody as OAuthToken;
-    if (!token.access_token) {
-      throw new Error('Severa token response did not include access_token.');
+    const body = await readResponseBody(response, 'POST');
+    const token = body !== null && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
+    const accessToken = token.access_token;
+    if (typeof accessToken !== 'string' || accessToken === '') {
+      throw new Error('The Severa token answer held no access token.');
     }
+    if (!/^[!-~]+$/.test(accessToken)) {
+      // A token that is not printable ASCII cannot be sent in a header, and is not kept or quoted.
+      throw new Error('The Severa token answer held an access token this server cannot use.');
+    }
+    // The issued tokens are secrets of this client from now on: redacted wherever they would appear.
+    this.addSecret(accessToken);
+    if (typeof token.refresh_token === 'string') this.addSecret(token.refresh_token);
 
+    const expiresIn = Number(token.expires_in ?? 3600);
     this.cachedToken = {
-      accessToken: token.access_token,
-      expiresAt: now + Math.max(1, Number(token.expires_in ?? 3600)) * 1000,
-      scope: token.scope,
+      accessToken,
+      expiresAt: now + (Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : 3600) * 1000,
+      scope: typeof token.scope === 'string' ? token.scope : undefined,
     };
     return this.cachedToken;
   }
@@ -211,61 +284,82 @@ export function paginationQuery(input: {
   };
 }
 
-const MAX_ERROR_BODY_BYTES = 64 * 1024;
+/** System error codes a network error may name: a fixed list, so no other text from a cause is ever shown. */
+const SHOWN_NETWORK_CODES: ReadonlySet<string> = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ECONNABORTED',
+  'ETIMEDOUT',
+  'EPIPE',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_SOCKET',
+  'CERT_HAS_EXPIRED',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'ERR_TLS_CERT_ALTNAME_INVALID',
+]);
+
+/** A network failure in our own words: only a system error code from a fixed list, never a message. */
+function transportError(error: unknown, method: string, timeoutMs: number): Error {
+  // The address is configuration and is not quoted.
+  if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+    return timeoutError(`Severa API request timed out after ${timeoutMs} ms (${method}).`);
+  }
+  const code = error instanceof Error ? (error.cause as { code?: unknown } | undefined)?.code : undefined;
+  const shown = typeof code === 'string' && SHOWN_NETWORK_CODES.has(code) ? ` (${code})` : '';
+  return new Error(`Network error calling the Severa API (${method})${shown}.`);
+}
+
+/** Our own text for a timeout, named TimeoutError so the audit records it as `timeout`. */
+function timeoutError(message: string): Error {
+  const error = new Error(message);
+  error.name = 'TimeoutError';
+  return error;
+}
+
+/** Whether a content type is JSON: application/json or a +json type, with or without parameters. */
+function isJsonContentType(contentType: string): boolean {
+  const type = contentType.split(';')[0]?.trim().toLowerCase() ?? '';
+  return type === 'application/json' || (type.startsWith('application/') && type.endsWith('+json'));
+}
 
 /**
- * Reads the response body. Redirects are refused (they are never followed),
- * and error bodies are read only up to MAX_ERROR_BODY_BYTES.
+ * Reads a successful response body: JSON (depth-limited). Anything else (another content type, or JSON that does not
+ * parse) is refused with a fixed text: it would reach the caller without the field masking that applies to data.
  */
-async function readResponseBody(response: Response): Promise<unknown> {
-  if (response.status >= 300 && response.status < 400) {
-    await response.body?.cancel().catch(() => undefined);
-    return 'Redirect responses are not followed, so credentials are never sent to another host.';
-  }
-  if (response.status === 204) {
-    return null;
+async function readResponseBody(response: Response, method: string): Promise<unknown> {
+  let text: string;
+  try {
+    text = await response.text();
+  } catch (error) {
+    // Anything thrown while reading the body is replaced by our own text: its message is not ours.
+    if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+      throw timeoutError(`Severa API response timed out while it was being read (${method}).`);
+    }
+    throw new Error(`The Severa API response could not be read (${method}).`);
   }
 
-  const text = response.ok ? await response.text() : await readTextUpTo(response, MAX_ERROR_BODY_BYTES);
   if (!text) {
     return null;
   }
 
-  const contentType = response.headers.get('content-type') ?? '';
-  if (!contentType.includes('application/json')) {
-    return text;
+  if (!isJsonContentType(response.headers.get('content-type') ?? '')) {
+    throw new Error(`Severa API answered with a content type this server does not read (${method}).`);
   }
 
   try {
-    return JSON.parse(text) as unknown;
+    // Depth-limited at once, so nothing downstream (a handler's JSON text, the gateway) can exhaust the stack.
+    return limitDepth(JSON.parse(text) as unknown);
   } catch {
-    return text;
+    throw new Error(`Severa API answered with JSON that could not be read (${method}).`);
   }
-}
-
-/** Reads at most `limit` bytes of a response body as text and discards the rest. */
-async function readTextUpTo(response: Response, limit: number): Promise<string> {
-  if (!response.body) {
-    return '';
-  }
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (total < limit) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      chunks.push(value);
-      total += value.byteLength;
-    }
-  } catch {
-    // Report what arrived before the body failed.
-  } finally {
-    await reader.cancel().catch(() => undefined);
-  }
-  return Buffer.concat(chunks).subarray(0, limit).toString('utf8');
 }
 
 function appendQueryValue(searchParams: URLSearchParams, key: string, value: SeveraQueryValue): void {
@@ -296,7 +390,8 @@ function assertSafeBaseUrl(baseUrl: string): void {
   try {
     parsed = new URL(baseUrl);
   } catch {
-    throw new Error(`SEVERA_BASE_URL is not a valid URL: ${baseUrl}`);
+    // The value is not quoted: configuration is never echoed.
+    throw new Error('The Severa base URL is not a valid URL.');
   }
 
   if (parsed.protocol === 'https:') {
@@ -308,7 +403,7 @@ function assertSafeBaseUrl(baseUrl: string): void {
   }
 
   throw new Error(
-    `Refusing to send Severa credentials over ${parsed.protocol}//. Use https:// (loopback http:// is allowed for local mocks).`,
+    'Refusing to send Severa credentials over a connection that is not https. Use https:// (loopback http:// is allowed for local mocks).',
   );
 }
 

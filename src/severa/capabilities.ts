@@ -86,9 +86,13 @@ const CURATED_CAPABILITIES: SeveraCapability[] = [
   toolCapability('severa_commit_prepared_request', 'Commit Prepared Severa Request', 'Execute a prepared Severa write/delete request after hash confirmation and policy approval.', 'write', ['depends on operation'], ['commit', 'mutation', 'policy']),
 ];
 
-export function searchCapabilities(query: string, limit: number): SeveraCapability[] {
+/**
+ * Capabilities matching the query, best first. With `offered` (a gateway instance) only the tools it offers, the read
+ * operations only when it offers the REST read, and the schemas only when it offers get_schema.
+ */
+export function searchCapabilities(query: string, limit: number, offered?: ReadonlySet<string>): SeveraCapability[] {
   const normalized = query.trim().toLowerCase();
-  const capabilities = allCapabilities();
+  const capabilities = offered ? offeredCapabilities(offered) : allCapabilities();
   const scored = capabilities
     .map(capability => ({ capability, score: capabilityScore(capability, normalized) }))
     .filter(item => !normalized || item.score > 0)
@@ -156,6 +160,16 @@ function allCapabilities(): SeveraCapability[] {
     ...CURATED_CAPABILITIES,
     ...SEVERA_OPERATIONS.map(operationCapability),
     ...Object.keys(SEVERA_SCHEMAS).map(schemaCapability),
+  ];
+}
+
+function offeredCapabilities(offered: ReadonlySet<string>): SeveraCapability[] {
+  return [
+    ...CURATED_CAPABILITIES.filter(capability => offered.has(capability.id)),
+    ...(offered.has('severa_rest_read')
+      ? SEVERA_OPERATIONS.filter(operation => operation.risk === 'read').map(operationCapability)
+      : []),
+    ...(offered.has('severa_get_schema') ? Object.keys(SEVERA_SCHEMAS).map(schemaCapability) : []),
   ];
 }
 

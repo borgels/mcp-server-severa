@@ -59,17 +59,34 @@ describe('SeveraClient', () => {
     expect(() => new SeveraClient({ accessToken: 'token', baseUrl: 'http://127.0.0.1:4010' })).not.toThrow();
   });
 
-  it('formats and redacts API errors', async () => {
+  it('formats API errors in our own words, with the status first and nothing of the body', async () => {
     const error = new SeveraHttpError({
       status: 401,
       method: 'GET',
       url: 'https://example.test/v1/customers',
-      payload: { error: 'invalid_token', error_description: 'Bearer super-secret failed' },
+      requestId: 'vendor-request-id',
     });
 
-    expect(error.message).toContain('Severa API request failed with HTTP 401');
-    expect(formatUnknownError(error)).not.toContain('super-secret');
+    expect(error.message).toBe(
+      'Severa API request failed with HTTP 401 | Severa rejected the access token (expired or revoked). A new token is requested on the next call.',
+    );
+    expect(formatUnknownError(error)).not.toContain('vendor-request-id');
     expect(redactSecrets('SEVERA_CLIENT_SECRET=abc Authorization: Bearer xyz')).toContain('[REDACTED]');
+  });
+
+  it('words a failed token request as our own text, never quoting the answer', async () => {
+    const client = new SeveraClient({
+      clientId: 'client-id-0123456789',
+      clientSecret: 'client-secret-0123456789',
+      baseUrl: 'https://example.test',
+      credentialEnv: {},
+      fetchImpl: (async () =>
+        Response.json({ error: 'invalid_client', error_description: 'client-secret-0123456789 unknown' }, { status: 401 })) as unknown as typeof fetch,
+    });
+    const error = (await client.get('/v1/customers').catch((e: unknown) => e)) as Error;
+    expect(error.message).toBe(
+      'Severa API request failed with HTTP 401 | Severa refused the client credentials (invalid, revoked, or without the requested scope). Retrying will not help.',
+    );
   });
 });
 
@@ -97,13 +114,29 @@ describe('SeveraClient hardening', () => {
     expect(calls.every(init => init.redirect === 'manual')).toBe(true);
   });
 
-  it('reads at most 64 KB of an error body', async () => {
+  it('never reads an error body', async () => {
+    let read = false;
     const client = new SeveraClient({
-      clientId: 'id', clientSecret: 'secret-value',
-      fetchImpl: (async () => new Response('x'.repeat(1_000_000), { status: 500 })) as unknown as typeof fetch,
+      accessToken: 'static-token-value',
+      baseUrl: 'https://example.test',
+      fetchImpl: (async () => ({
+        ok: false,
+        status: 500,
+        headers: new Headers(),
+        body: null,
+        text: async () => {
+          read = true;
+          return 'vendor diagnostic';
+        },
+        json: async () => {
+          read = true;
+          return {};
+        },
+      })) as unknown as typeof fetch,
     });
     const error = (await client.get('/v1/customers').catch((e: unknown) => e)) as Error;
-    expect(error.message.length).toBeLessThan(70_000);
+    expect(error.message).toBe('Severa API request failed with HTTP 500');
+    expect(read).toBe(false);
   });
 
   it('rejects an invalid SEVERA_TIMEOUT_MS instead of using NaN', () => {
