@@ -204,11 +204,17 @@ used for local governance rather than sent upstream.
 
 ## Security And Audit
 
-- Credentials are read from environment variables only.
+- The MCP server reads credentials from environment variables only; an
+  embedded gateway takes them only from its options (see
+  [Embedding](#embedding-gateway)).
 - `SEVERA_BASE_URL` must be `https://`; loopback `http://` is allowed for local
   mocks.
-- Formatted errors redact Authorization, client secrets, access tokens, refresh
-  tokens, and token-like material.
+- Errors are our own texts with the HTTP status; Severa's response bodies,
+  messages and request ids are never read into an error. Formatted errors also
+  redact Authorization, client secrets, access tokens, refresh tokens, and
+  token-like material.
+- A successful answer that is not JSON (`application/json` or a `+json` type)
+  is refused with a fixed text instead of being passed on as text.
 - Optional JSONL audit logging stores hashed targets and hashed idempotency
   keys, not raw request bodies.
 - The Streamable HTTP transport binds to `127.0.0.1` by default.
@@ -249,6 +255,129 @@ these variables also stop it at startup instead of being ignored. On a loopback
 bind, only `localhost`, `127.0.0.1`, `[::1]` or the bind address are accepted
 in the `Host` header (DNS-rebinding protection); set `MCP_ALLOWED_HOSTS` to
 change this. `GET /healthz` answers without authentication.
+
+## Embedding (`./gateway`)
+
+`mcp-server-severa/gateway` lets a host application run the tools in-process
+instead of over MCP, in the same shape as `mcp-server-template`. One process
+can run several gateway instances, for example one per tenant.
+
+```ts
+import { createSeveraGateway, severaToolCatalog } from 'mcp-server-severa/gateway';
+
+const gateway = createSeveraGateway({
+  clientId: tenant.severaClientId,
+  clientSecret: tenant.severaClientSecret,
+  policy: { audit: record => log(record) },
+});
+const result = await gateway.callTool('search_customers', { isActive: true }, { caller: 'user-1', requestId: 'r-1' });
+```
+
+The module exports:
+
+- `createSeveraGateway({ clientId, clientSecret, baseUrl?, fetchImpl?, timeoutMs?, policy? })`.
+  `clientId` and `clientSecret` are the customer's Severa API client
+  credentials. Both are required and never read from the environment. The
+  instance asks Severa for its own access token
+  (`POST /v1/login/oauth/token`, client credentials) with the fixed read-only
+  scope `SEVERA_READ_SCOPE`, caches it per instance (never shared with
+  another instance) and asks for a new one when it runs out or Severa rejects
+  it. `baseUrl` defaults to `https://api.severa.visma.com/rest-api`;
+  `timeoutMs` defaults to 30 seconds. The gateway reads no `SEVERA_*`
+  variable at all: not `SEVERA_CLIENT_ID`, `SEVERA_CLIENT_SECRET`,
+  `SEVERA_ACCESS_TOKEN`, `SEVERA_SCOPE`, `SEVERA_BASE_URL` or
+  `SEVERA_TIMEOUT_MS`, and none of the policy and audit variables. It has no
+  access-token or scope option (the stdio and HTTP transports keep them).
+- `gateway.tools` (the tools enabled on the instance) and
+  `gateway.callTool(name, input, { caller, requestId })`. Names are accepted
+  with or without the `severa_` prefix. Input is validated with the tool's zod
+  schema before anything is sent, and unknown fields are refused. The audit
+  records of the call hold `caller` only as an HMAC pseudonym (a per-process
+  key) and a request id of the server's own, the same for every record of the
+  call; the host's `requestId` is not written. An error is recorded as a fixed
+  code (`http_<status>`, `timeout` or `error`), never as its message.
+- `severaGatewayTools`: the definitions (`name` without prefix, `title`,
+  `description`, `riskLevel`, `enabledByDefault`, `inputSchema` as JSON
+  Schema derived from the zod schema the call is validated with).
+- `severaToolCatalog`: the same tools, deeply frozen, with `upstream` (method
+  and path template of every Severa request the tool may make, the token
+  request included) and `broad` (true when the input chooses what is read).
+  Hosts can build their own permission model from it without creating an
+  instance.
+- `SEVERA_READ_SCOPE`, `GatewayConfigError` and the types
+  (`SeveraGatewayOptions`, `SeveraGateway`, `InstancePolicy`, `AuditSink`,
+  `GatewayToolDefinition`, `GatewayToolCatalogEntry`,
+  `GatewayUpstreamOperation`, `GatewayToolResult`, `GatewayCallContext` and the
+  JSON types).
+
+| Tool | Risk | Broad | Severa requests (besides `POST /v1/login/oauth/token`) |
+|---|---|---|---|
+| `search_capabilities` | read | no | none (no token either) |
+| `check_connection` | read | no | `GET /heartbeat/authorized` |
+| `get_schema` | read | no | none (no token either) |
+| `search_customers` | read | no | `GET /v1/customers` |
+| `get_customer` | read | no | `GET /v1/customers/{guid}` |
+| `search_projects` | read | no | `GET /v1/projects`, `GET /v1/salescases` |
+| `get_project` | read | no | `GET /v1/projects/{guid}` |
+| `rest_read` | read | **yes** | every read operation of the OpenAPI catalog, chosen by `method` and `path` |
+
+`rest_read` reads anything the client may read, so it is the one broad tool:
+a host that grants tools per role should give it only to roles that may read
+everything. The prepare/commit write tools stay in the MCP server only.
+
+**Instance policy.** With `policy: { enableWrites, disabledTools, audit }`
+the host decides the instance's policy: the instance leaves the disabled
+tools out of `tools` (and out of `search_capabilities`), refuses them when
+called, and sends its audit records to `audit` (none without it).
+`disabledTools` must name gateway tools. A sink that throws on a start record
+refuses the call. Without `policy` the instance uses the default policy (no
+writes, no disabled tools, no audit records); it never reads
+`SEVERA_ENABLE_WRITES`, `SEVERA_POLICY_PATH` or `SEVERA_AUDIT_LOG`. Every call
+runs in a call scope of its own (AsyncLocalStorage), so a call made from
+inside another instance's call never inherits its policy, sink, redactor or
+caller. There is no process-wide registry of secrets.
+
+**Results.** A successful result has `structuredContent` and one text block:
+a short summary, a blank line, and the same data as compact JSON. The data
+is redacted twice against the instance's secrets (the client id, the client
+secret and every access token Severa issued to the instance: exact values,
+URL- and JSON-encoded forms and any piece of 6 characters or more, in
+strings, object keys and the string form of numbers and booleans) before it
+is serialised. A failure reported inside a successful answer is reduced to
+its HTTP status and our own text.
+
+**Errors.** An error result carries our own English text, never Severa's
+response body, message or request id, nor a redirect's `Location` or the
+configured address. An HTTP failure starts with
+`Severa API request failed with HTTP <status>`, followed by our own hint and
+the parsed `retry-after` where there is one, so a host can map it by status;
+a failed token request has a hint of its own (for 400, 401 and 403:
+`Severa refused the client credentials …`). Other errors start with
+`Invalid input for <tool>:`, `Unsupported Severa gateway tool.`,
+`Severa API responded with a redirect (HTTP <status>)`,
+`Network error calling the Severa API`, `Severa API request timed out after`,
+`The Severa token answer held …`, or the policy refusal.
+
+**Credential admission and the sink check.** A gateway accepts only a client
+id and a client secret of printable ASCII (0x21-0x7E) of at least 16
+characters each that share no piece of 6 characters with a string literal in
+`src/` (`src/fixed-corpus.generated.ts`, kept up to date by a test), with the
+fixed fallbacks (`src/fallbacks.ts`) or with the tool list. A refused
+credential throws `GatewayConfigError` when the gateway is created, before
+anything is built or sent; the refusal is a fixed text that holds no piece of
+either credential, and every error a gateway throws has no `cause` and a
+`stack` of only `name: message`. As the very last step, every output (the
+tool list, each result as a whole, each audit record) is checked in its final
+form, and one that still holds a piece of a credential or of an issued token
+is replaced by a fixed fallback. Residual risk: Severa echoing a secret back
+otherwise transformed (split into pieces shorter than 6 characters, reversed,
+hashed) is not recognised; such data reaches only the tenant whose secret it
+is. Severa chooses the access token, so it is checked when it arrives: a
+token (access or refresh) shorter than 16 characters, not printable ASCII, or
+sharing a piece with a fixed fallback is refused (`The Severa token answer
+held a token this server cannot use.`) and never used. It is not checked
+against all of our texts: a piece of it that happens to match one of them
+makes that text redacted or withheld in later outputs.
 
 ## Security model
 
