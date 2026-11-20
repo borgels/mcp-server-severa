@@ -86,7 +86,11 @@ async function outputs(
   if (role === 'issued') {
     // Severa issues the token during the first call; what was written before it (that call's start record) was
     // checked before the token existed. The session is checked from the first output after it.
-    await gw.callTool('check_connection');
+    const first = await gw.callTool('check_connection');
+    // A token the gateway refuses (too short, or sharing a piece with a fixed fallback) is never used or kept.
+    if (first.content[0]?.text === 'The Severa token answer held a token this server cannot use.') {
+      return { refused: first.content[0].text, outputs: [] };
+    }
     records.length = 0;
   }
   const results = [
@@ -111,6 +115,50 @@ async function outputs(
 
 const ROLES = ['secret', 'id', 'issued'] as const;
 
+describe('tokens Severa issues', () => {
+  const answer = (body: Record<string, unknown>): typeof fetch => async url =>
+    pathOf(url) === '/v1/login/oauth/token' ? json(body) : json([{ guid: 'c1', note: `echo ${JSON.stringify(body)}` }]);
+
+  it('refuses a short access or refresh token, so no token is used that the redactor cannot cover', async () => {
+    for (const body of [
+      { access_token: 'QzX7p9', expires_in: 3600 },
+      { access_token: 'QzX7p9aaaaaaaaa', expires_in: 3600 },
+      { access_token: ISSUED, refresh_token: 'QzX7p9', expires_in: 3600 },
+      { access_token: ISSUED, refresh_token: 42, expires_in: 3600 },
+    ]) {
+      const fetchImpl = vi.fn(answer(body));
+      const gw = createSeveraGateway({ ...CREDS, baseUrl: BASE, timeoutMs: 5_000, fetchImpl });
+      const result = await gw.callTool('search_customers');
+      expect(result, JSON.stringify(body)).toEqual({
+        isError: true,
+        content: [{ type: 'text', text: 'The Severa token answer held a token this server cannot use.' }],
+      });
+      // Only the token request: the refused token is never sent.
+      expect(fetchImpl).toHaveBeenCalledOnce();
+    }
+  });
+
+  it('refuses a token that shares a piece with a fixed fallback, so a fallback never holds a piece of a token in use', async () => {
+    for (const token of ['QzX7p9SeveraWithheldredactedR8t2', 'QzX7p9auditRecordR8t2zz', 'QzX7p9"isError":trueR8t2']) {
+      for (const field of ['access_token', 'refresh_token'] as const) {
+        const body = field === 'access_token' ? { access_token: token } : { access_token: ISSUED, refresh_token: token };
+        const records: unknown[] = [];
+        const fetchImpl = vi.fn(answer(body));
+        const gw = createSeveraGateway({
+          ...CREDS,
+          baseUrl: BASE,
+          timeoutMs: 5_000,
+          fetchImpl,
+          policy: { audit: record => void records.push(record) },
+        });
+        const result = await gw.callTool('search_customers');
+        expect(result.content[0]?.text, `${token} ${field}`).toBe('The Severa token answer held a token this server cannot use.');
+        expect(fetchImpl).toHaveBeenCalledOnce();
+      }
+    }
+  });
+});
+
 describe('the sink check', () => {
   it('holds for known counterexamples, for each credential and the issued token, through the sink and the file', async () => {
     for (const value of [
@@ -126,7 +174,7 @@ describe('the sink check', () => {
       for (const role of ROLES) {
         for (const viaFile of [false, true]) {
           const { refused, outputs: seen } = await outputs(value, role, viaFile);
-          if (refused !== undefined) expect(refused, value).toMatch(/credential was refused/);
+          if (refused !== undefined) expect(refused, value).toMatch(/credential was refused|token this server cannot use/);
           expect(leaked([value, ID, SECRET, ISSUED], seen), `${value} ${role} ${viaFile}`).toEqual([]);
         }
       }

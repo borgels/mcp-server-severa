@@ -13,7 +13,7 @@ describe('SeveraClient', () => {
     const fetchMock = vi.fn<typeof fetch>(async input => {
       const url = String(input);
       if (url.endsWith('/v1/login/oauth/token')) {
-        return Response.json({ access_token: 'token-1', expires_in: 3600, scope: 'customers:read' });
+        return Response.json({ access_token: 'issued-token-0000000001', expires_in: 3600, scope: 'customers:read' });
       }
       return Response.json({ ok: true }, { headers: { NextPageToken: 'next-page' } });
     });
@@ -33,7 +33,7 @@ describe('SeveraClient', () => {
     expect(fetchMock.mock.calls[0]?.[1]?.body).toContain('"grant_type":"client_credentials"');
     expect(fetchMock.mock.calls[1]?.[1]?.headers).toMatchObject({
       Accept: 'application/json',
-      Authorization: 'Bearer token-1',
+      Authorization: 'Bearer issued-token-0000000001',
     });
     expect(String(fetchMock.mock.calls[1]?.[0])).toContain('customerNames=Acme');
   });

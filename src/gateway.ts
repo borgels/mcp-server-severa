@@ -118,7 +118,7 @@ export interface GatewayToolCatalogEntry {
 export interface SeveraGatewayOptions
   extends Omit<
     SeveraClientOptions,
-    'clientId' | 'clientSecret' | 'scope' | 'accessToken' | 'baseUrl' | 'credentialEnv' | 'redactor'
+    'clientId' | 'clientSecret' | 'scope' | 'accessToken' | 'baseUrl' | 'credentialEnv' | 'redactor' | 'acceptsIssuedToken'
   > {
   /** The customer's Severa API client id. Required; never read from the environment. */
   clientId: string;
@@ -422,8 +422,10 @@ function buildSeveraGateway(options: SeveraGatewayOptions, credentials: Credenti
     scope: _scope,
     credentialEnv: _credentialEnv,
     redactor: _redactor,
+    acceptsIssuedToken: _acceptsIssuedToken,
     ...clientOptions
-  } = options as SeveraGatewayOptions & Pick<SeveraClientOptions, 'accessToken' | 'scope' | 'credentialEnv' | 'redactor'>;
+  } = options as SeveraGatewayOptions &
+    Pick<SeveraClientOptions, 'accessToken' | 'scope' | 'credentialEnv' | 'redactor' | 'acceptsIssuedToken'>;
   // Always a policy: the host's, or the default one. A gateway call never reads policy or audit variables.
   const policy: ResolvedInstancePolicy = resolveInstancePolicy(hostPolicy ?? {}, GATEWAY_TOOL_NAMES);
   const client = new SeveraClient({
@@ -435,6 +437,9 @@ function buildSeveraGateway(options: SeveraGatewayOptions, credentials: Credenti
     timeoutMs: timeoutMs ?? DEFAULT_TIMEOUT_MS,
     credentialEnv: {},
     redactor,
+    // Severa chooses the tokens, so they are checked when they arrive: one that shares a piece with a fixed fallback
+    // is refused (never used), so a fallback that replaces an output never holds a piece of a token in use.
+    acceptsIssuedToken: issued => !leaksSecret(fixedOutputs(), new SecretRedactor().addSecret(issued)),
   });
   const handlers = registeredTools(client);
   const offeredTools: ReadonlySet<string> = new Set(GATEWAY_TOOL_NAMES.filter(name => !policy.disabledTools.has(name)));

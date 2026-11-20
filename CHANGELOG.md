@@ -20,7 +20,9 @@ shared process.
   issued access token (and a refresh token, if any) is a secret of the
   instance from then on, redacted like the client id and secret. A token
   Severa rejects (401) is dropped, and the next call asks for a new one;
-  concurrent calls share one token request.
+  concurrent calls share one token request. An issued token shorter than 16
+  characters, not printable ASCII, or (in the gateway) sharing a piece with a
+  fixed fallback is refused and never used.
 - Credential admission: printable ASCII, at least 16 characters, no piece of
   6 characters shared with the server's own texts, its fixed fallbacks or the
   tool list, for the client id and the client secret alike. A refused

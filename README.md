@@ -356,7 +356,7 @@ a failed token request has a hint of its own (for 400, 401 and 403:
 `Invalid input for <tool>:`, `Unsupported Severa gateway tool.`,
 `Severa API responded with a redirect (HTTP <status>)`,
 `Network error calling the Severa API`, `Severa API request timed out after`,
-`The Severa token answer held`, or the policy refusal.
+`The Severa token answer held …`, or the policy refusal.
 
 **Credential admission and the sink check.** A gateway accepts only a client
 id and a client secret of printable ASCII (0x21-0x7E) of at least 16
@@ -372,9 +372,12 @@ form, and one that still holds a piece of a credential or of an issued token
 is replaced by a fixed fallback. Residual risk: Severa echoing a secret back
 otherwise transformed (split into pieces shorter than 6 characters, reversed,
 hashed) is not recognised; such data reaches only the tenant whose secret it
-is. Severa chooses the access token, so it is not admitted like the
-credentials: a piece of it that happens to match one of our own texts makes
-that text redacted or withheld in later outputs.
+is. Severa chooses the access token, so it is checked when it arrives: a
+token (access or refresh) shorter than 16 characters, not printable ASCII, or
+sharing a piece with a fixed fallback is refused (`The Severa token answer
+held a token this server cannot use.`) and never used. It is not checked
+against all of our texts: a piece of it that happens to match one of them
+makes that text redacted or withheld in later outputs.
 
 ## Security model
 

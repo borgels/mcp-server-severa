@@ -9,6 +9,9 @@ export type SeveraQueryValue = string | number | boolean | null | undefined | Ar
 /** The client-credentials token request, relative to the base URL. It is an upstream request like any other. */
 export const TOKEN_PATH = '/v1/login/oauth/token';
 
+/** Issued tokens shorter than this are refused: every piece of a token must be long enough to be redacted. */
+export const MIN_ISSUED_TOKEN_LENGTH = 16;
+
 export interface SeveraClientOptions {
   clientId?: string;
   clientSecret?: string;
@@ -29,6 +32,11 @@ export interface SeveraClientOptions {
    * process-wide redactor.
    */
   redactor?: SecretRedactor;
+  /**
+   * A further check of every token Severa issues (the gateway: no piece shared with its fixed fallbacks). A token it
+   * refuses is never used.
+   */
+  acceptsIssuedToken?: (token: string) => boolean;
 }
 
 export interface SeveraRequest {
@@ -59,6 +67,7 @@ export class SeveraClient {
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
   private readonly ownRedactor: boolean;
+  private readonly acceptsIssuedToken?: (token: string) => boolean;
   /** This client's token: never shared with another client, so never with another gateway instance. */
   private cachedToken?: CachedToken;
   private pendingToken?: Promise<CachedToken>;
@@ -74,6 +83,7 @@ export class SeveraClient {
     this.staticAccessToken = options.accessToken ?? env.SEVERA_ACCESS_TOKEN;
     this.redactor = options.redactor ?? new SecretRedactor();
     this.ownRedactor = !options.redactor;
+    this.acceptsIssuedToken = options.acceptsIssuedToken;
     for (const secret of [this.clientId, this.clientSecret, this.staticAccessToken]) {
       this.addSecret(secret);
     }
@@ -243,13 +253,23 @@ export class SeveraClient {
     if (typeof accessToken !== 'string' || accessToken === '') {
       throw new Error('The Severa token answer held no access token.');
     }
-    if (!/^[!-~]+$/.test(accessToken)) {
-      // A token that is not printable ASCII cannot be sent in a header, and is not kept or quoted.
-      throw new Error('The Severa token answer held an access token this server cannot use.');
+    const refreshToken = token.refresh_token;
+    for (const issued of [accessToken, ...(refreshToken === undefined || refreshToken === null ? [] : [refreshToken])]) {
+      // Only a token this client can keep out of every output is used: printable ASCII (it goes in a header), at
+      // least MIN_ISSUED_TOKEN_LENGTH characters (so every piece of it is redacted), and accepted by the gateway's
+      // check (no piece shared with its fixed fallbacks). A refused token is dropped: never used, kept or quoted.
+      if (
+        typeof issued !== 'string' ||
+        issued.length < MIN_ISSUED_TOKEN_LENGTH ||
+        !/^[!-~]+$/.test(issued) ||
+        (this.acceptsIssuedToken !== undefined && !this.acceptsIssuedToken(issued))
+      ) {
+        throw new Error('The Severa token answer held a token this server cannot use.');
+      }
     }
     // The issued tokens are secrets of this client from now on: redacted wherever they would appear.
     this.addSecret(accessToken);
-    if (typeof token.refresh_token === 'string') this.addSecret(token.refresh_token);
+    if (typeof refreshToken === 'string') this.addSecret(refreshToken);
 
     const expiresIn = Number(token.expires_in ?? 3600);
     this.cachedToken = {
