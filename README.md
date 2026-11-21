@@ -346,7 +346,7 @@ strings, object keys and the string form of numbers and booleans) before it
 is serialised. A failure reported inside a successful answer is reduced to
 its HTTP status and our own text.
 
-**Errors.** An error result carries our own English text, never Severa's
+**Errors.** The text of an error result is our own English, never Severa's
 response body, message or request id, nor a redirect's `Location` or the
 configured address. An HTTP failure starts with
 `Severa API request failed with HTTP <status>`, followed by our own hint and
@@ -357,6 +357,16 @@ a failed token request has a hint of its own (for 400, 401 and 403:
 `Severa API responded with a redirect (HTTP <status>)`,
 `Network error calling the Severa API`, `Severa API request timed out after`,
 `The Severa token answer held …`, or the policy refusal.
+
+**Failure metadata.** When Severa answered with an HTTP error (a failed token
+request and a refused redirect included), the error result also has
+`failure: { httpStatus, requestId? }`: the status, and Severa's request id
+from a response header (`REQUEST_ID_HEADERS` in `src/errors.ts`) only when it
+is a hex id of 8 to 64 characters (one run of hex digits, or groups of four or
+more joined by single hyphens, as in a UUID) and does not hold the shape of a
+personal number. It is checked again after redaction. A host can count
+failures from it without reading their text. Never the response body,
+Severa's error code or message.
 
 **Credential admission and the sink check.** A gateway accepts only a client
 id and a client secret of printable ASCII (0x21-0x7E) of at least 16
