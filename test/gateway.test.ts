@@ -593,7 +593,7 @@ describe('Severa gateway errors', () => {
       );
       const gateway = createSeveraGateway({ ...A, baseUrl: BASE, fetchImpl });
       const result = await gateway.callTool('search_customers');
-      expect(result).toEqual({ isError: true, content: [{ type: 'text', text }] });
+      expect(result).toEqual({ isError: true, content: [{ type: 'text', text }], failure: { httpStatus: status } });
       expect(fetchImpl).toHaveBeenCalledOnce();
     }
   });

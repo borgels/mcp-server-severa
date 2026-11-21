@@ -1,5 +1,5 @@
 import { readEnvInteger } from '../config-env.js';
-import { limitDepth, nestedFailuresAsStatus, SeveraHttpError } from '../errors.js';
+import { limitDepth, nestedFailuresAsStatus, requestIdFrom, SeveraHttpError, SeveraRedirectError } from '../errors.js';
 import { describeUrl, discardBody, isRedirect, registerSecret, SecretRedactor } from '../upstream-http.js';
 import { SEVERA_DEFAULT_BASE_URL } from './openapi-catalog.js';
 
@@ -136,7 +136,7 @@ export class SeveraClient {
         method: request.method,
         url: describeUrl(url),
         retryAfter: response.headers.get('retry-after') ?? undefined,
-        requestId: response.headers.get('x-request-id') ?? response.headers.get('request-id') ?? undefined,
+        requestId: requestIdFrom(response.headers),
       });
     }
 
@@ -187,9 +187,11 @@ export class SeveraClient {
     if (isRedirect(response.status)) {
       // The Location is Severa's text and is never quoted, and the address is configuration.
       await discardBody(response);
-      throw new Error(
+      throw new SeveraRedirectError(
         `Severa API responded with a redirect (HTTP ${response.status}) for ${method}; ` +
           'redirects are not followed, so credentials are never sent to another host. Check the configured base URL.',
+        response.status,
+        requestIdFrom(response.headers),
       );
     }
     return response;
@@ -243,6 +245,7 @@ export class SeveraClient {
         method: 'POST',
         url: describeUrl(url),
         retryAfter: response.headers.get('retry-after') ?? undefined,
+        requestId: requestIdFrom(response.headers),
         tokenRequest: true,
       });
     }
